@@ -12,29 +12,33 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
-  
+
 env:
   MPLBACKEND: agg
   OPENBLAS_NUM_THREADS: 1
+  PYTEST_XDIST_AUTO_NUM_WORKERS: 8
 
 jobs:
   test:
-    runs-on: scilus-runners
+    runs-on: scilus-large
     if: github.repository == 'scilus/scilpy'
 
     steps:
       - name: Checkout repository at merge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Fetch python version from repository
         id: python-selector
-        run: echo "python-version=$(head -1 .python-version)" >> $GITHUB_OUTPUT
+        run: |
+          echo "python-version=$(head -1 .python-version)" >> $GITHUB_OUTPUT
+          echo "C_INCLUDE_PATH=$pythonLocation/include/python$(head -1 .python-version):$C_INCLUDE_PATH" >> $GITHUB_ENV
 
-      - name: Set up Python for Scilpy
-        uses: actions/setup-python@v5.0.0
+      - name: Set up Python and uv for Scilpy
+        uses: astral-sh/setup-uv@v8.2.0
         with:
           python-version: ${{ steps.python-selector.outputs.python-version }}
-          cache: 'pip'
+          activate-environment: true
+          enable-cache: true
 
       - name: Install non-python dependencies
         run: |
@@ -45,30 +49,51 @@ jobs:
             git \
             libblas-dev \
             liblapack-dev \
-            libfreetype6-dev
+            libfreetype6-dev \
+            libdrm-dev \
+            libgl1-mesa-dev \
+            libosmesa6-dev \
+            python3-dev \
+
+      - name: stdlib checkout
+        if: ${{ !contains(steps.python-selector.outputs.python-version, '3.12') }}
+        run: |
+          echo "SETUPTOOLS_USE_DISTUTILS=stdlib" >> "$GITHUB_ENV"
 
       - name: Install Scilpy
         run: |
-          export SETUPTOOLS_USE_DISTUTILS=stdlib
-          python -m pip install --upgrade pip wheel
-          python -m pip install --upgrade "setuptools<71.0.0" 
-          python -m pip install -e .
+          uv pip install --upgrade pip wheel
+          uv pip install --upgrade "setuptools<71.0.0" 
+          uv pip install -e .
+          # TODO: to adapt once Scilpy passes to VTK 9.4.0, which selects OSMesa at runtime
+          # https://discourse.vtk.org/t/status-update-runtime-opengl-render-window-selection-in-vtk/14583
+          VTK_VERSION=$(cat pyproject.toml | grep 'vtk==' | sed 's/vtk==//g' | sed 's/\"//g' )
+          pip install --extra-index-url https://wheels.vtk.org vtk-osmesa==$VTK_VERSION
+          uv pip install pytest-xdist pytest-cov
+          scil_data_download
+          scil_search_keywords test --regenerate_help_files --processes 8
 
-      - name: Run tests
+      - name: Run unit tests
         run: |
-          export C_INCLUDE_PATH=$pythonLocation/include/python${{ steps.python-selector.outputs.python-version }}:$C_INCLUDE_PATH
-          pytest --cov-report term-missing:skip-covered
+          uv run --active pytest src/scilpy --cov-report term-missing:skip-covered --dist=loadgroup --ignore=src/scilpy/cli
+          mv .test_reports unit_test_reports
+
+      - name: Run smoke tests
+        run: |
+          uv run --active pytest src/scilpy/cli --cov-report term-missing:skip-covered --dist=loadgroup
+          mv .coverage .coverage.smoke
+          mv .test_reports smoke_test_reports
 
       - name: Save test results and coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         id: test-coverage-results
         with:
           name: test-coverage-${{ github.run_id }}
           retention-days: 1
           include-hidden-files: true
           path: |
-            .coverage
-            .test_reports/
+            unit_test_reports/
+            smoke_test_reports/
 
   coverage:
     runs-on: ubuntu-latest
@@ -77,29 +102,31 @@ jobs:
 
     steps:
       - name: Checkout repository at merge
-        uses: actions/checkout@v4
-
-      - name: Set up Python for codecov upload
-        uses: actions/setup-python@v5.0.0
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Install pycoverage
-        run: pip install coverage
+        uses: actions/checkout@v7
 
       - name: Download test results and coverage
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: test-coverage-${{ github.run_id }}
 
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          files: unit_test_reports/*
+          disable_search: true
           flags: unittests
-          name: scilpy-unittests-${{ github.run_id }}-${{ github.run_attempt }}
+          name: scilpy-tests-${{ github.run_id }}-${{ github.run_attempt }}
           verbose: true
           fail_ci_if_error: true
-          plugin: pycoverage
 
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: smoke_test_reports/*
+          disable_search: true
+          flags: smoketests
+          name: scilpy-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          verbose: true
+          fail_ci_if_error: true
